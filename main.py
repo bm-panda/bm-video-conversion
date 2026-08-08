@@ -6,15 +6,18 @@ import json
 import os
 import shutil
 import subprocess
-
 import sys
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 from pathlib import Path
 from typing import List
+
+# ── 路径与模板 ──
+BASE_DIR = Path(__file__).parent
+CONFIG_PATH = BASE_DIR / "config.json"
+CONFIG_TEMPLATE = BASE_DIR / "config.html"
+APP_DATA_MARKER = "/*__APP_DATA__*/"
 
 # ==================== 视频格式定义 ====================
 # 所有输出格式
@@ -103,7 +106,7 @@ WMV_VIDEO_CODECS = {"auto", "wmv2"}
 GIF_DEFAULT_FPS = "15"
 GIF_MAX_WIDTH = 480
 
-# 下拉选项的显示文案（key 与 converter.py 的合法值一致；dict 顺序即下拉顺序）
+# 下拉选项的显示文案（dict 顺序即下拉顺序）
 VIDEO_CODEC_OPTIONS = {
     "auto": "自动 (跟随格式)",
     "libx264": "H.264 (兼容性最佳)",
@@ -153,75 +156,66 @@ DEFAULT_CONFIG = {
     "overwrite": False,
 }
 
-TEMPLATE_PATH = Path(__file__).parent / "config.html"
-CONFIG_PATH = Path(__file__).parent / "config.json"
+# 右键可选的视频扩展名（与 bm-scripts-box-rc.toml 的 filters 一致）
+VIDEO_EXTS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".ts", ".m4v",
+    ".mpg", ".mpeg", ".m2ts", ".mts", ".3gp", ".ogv", ".vob", ".rmvb", ".rm", ".asf",
+}
 
-# 模板里这个占位符会被替换为 `const APP_DATA = {...};`
-APP_DATA_MARKER = "/*__APP_DATA__*/"
-
-# 统一输出编码，避免 GBK 控制台下 emoji/中文报错（盒子环境已设 PYTHONUTF8=1）
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except (AttributeError, ValueError):
-        pass
 
 class VideoConverter:
-    """视频格式转换器(基于 FFmpeg)"""
+    """视频格式转换器（基于 FFmpeg），承载通用 subprocess 执行，只产数据。"""
 
-    def __init__(self, videos: List[str], output_dir: str = "", output_format: str = "mp4",
-                 video_codec: str = "auto", resolution: str = "original",
-                 quality: str = "standard", fps: str = "original",
-                 audio_mode: str = "copy", overwrite: bool = False):
-        """
-        初始化转换器
+    @staticmethod
+    def _run(cmd, **kw):
+        """执行命令，默认隐藏控制台窗口、按 UTF-8 容错解码。"""
+        kw.setdefault("creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        kw.setdefault("encoding", "utf-8")
+        return subprocess.run(cmd, text=True, errors="replace", **kw)
 
-        Args:
-            videos: 视频文件路径列表
-            output_dir: 输出目录（为空则保存到源文件目录）
-            output_format: 输出格式 (mp4/mkv/avi/mov/webm/gif/m4v/flv/wmv/ts)
-            video_codec: 视频编码器 (auto/libx264/libx265/libvpx-vp9/mpeg4)
-            resolution: 分辨率 (original/480p/720p/1080p)
-            quality: 画质 (best/high/standard/low/small)
-            fps: 帧率 (original/24/25/30/50/60)
-            audio_mode: 音频处理 (copy/encode/none)
-            overwrite: 是否覆盖已存在的文件
-        """
-        self.videos = videos
-        self.output_dir = output_dir or ""
-        self.output_format = output_format.strip().lstrip(".").lower()
+    @staticmethod
+    def _require_binaries():
+        """同时校验 ffmpeg 与 ffprobe，缺则直接报错（供 Cli 开局预检）。"""
+        if not shutil.which("ffmpeg"):
+            raise FileNotFoundError("未找到 FFmpeg，请安装并加入环境变量 PATH（https://ffmpeg.org/download.html）")
+        if not shutil.which("ffprobe"):
+            raise FileNotFoundError("未找到 ffprobe，请确认已完整安装 FFmpeg（含 ffprobe）并加入 PATH")
 
+    def __init__(self, videos, config):
+        """videos: 视频文件路径列表；config: 配置 dict（见 DEFAULT_CONFIG）。"""
+        self.videos = [v for v in videos if Path(v).exists()]
+        c = config
+
+        self.output_dir = str(c.get("output_dir") or "").strip()
+        self.output_format = str(c.get("format") or "mp4").strip().lstrip(".").lower()
         if self.output_format not in VIDEO_FORMATS:
             raise ValueError(f"不支持的格式：{self.output_format}，支持：{', '.join(VIDEO_FORMATS)}")
 
         # 非法参数值回退默认
-        self.video_codec = video_codec if video_codec in ALLOWED_VIDEO_CODECS else "auto"
-        self.resolution = resolution if resolution in {"original", *RESOLUTIONS} else "original"
-        self.quality = quality if quality in ALLOWED_QUALITIES else "standard"
-        self.fps = fps if fps in ALLOWED_FPS else "original"
-        self.audio_mode = audio_mode if audio_mode in ALLOWED_AUDIO_MODES else "copy"
-        self.overwrite = overwrite
+        self.video_codec = c.get("video_codec") if c.get("video_codec") in ALLOWED_VIDEO_CODECS else "auto"
+        self.resolution = c.get("resolution") if c.get("resolution") in {"original", *RESOLUTIONS} else "original"
+        self.quality = c.get("quality") if c.get("quality") in ALLOWED_QUALITIES else "standard"
+        self.fps = c.get("fps") if c.get("fps") in ALLOWED_FPS else "original"
+        self.audio_mode = c.get("audio_mode") if c.get("audio_mode") in ALLOWED_AUDIO_MODES else "copy"
+        self.overwrite = bool(c.get("overwrite"))
 
+        self._require_binaries()
         self._ffmpeg = shutil.which("ffmpeg")
-        if not self._ffmpeg:
-            raise FileNotFoundError("未找到 FFmpeg（ffmpeg 命令），请确认已安装并在环境变量中")
         self._ffprobe = shutil.which("ffprobe")
 
-        # 创建输出目录
         if self.output_dir:
             os.makedirs(self.output_dir, exist_ok=True)
 
     def _get_audio_codec(self, input_path: str):
-        """探测输入文件的第一个音轨编码器，无音轨或探测失败返回 None"""
+        """探测输入文件第一条音轨的编码器，无音轨或探测失败返回 None。"""
         if not self._ffprobe:
             return None
         try:
-            proc = subprocess.run(
+            proc = self._run(
                 [self._ffprobe, "-v", "error", "-select_streams", "a:0",
                  "-show_entries", "stream=codec_name",
                  "-of", "default=nw=1:nk=1", input_path],
-                capture_output=True, text=True, errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                capture_output=True,
             )
             if proc.returncode == 0:
                 codec = proc.stdout.strip()
@@ -231,15 +225,14 @@ class VideoConverter:
         return None
 
     def _get_duration(self, input_path: str):
-        """探测输入视频总时长（秒），失败返回 None"""
+        """探测输入视频总时长（秒），失败返回 None。"""
         if not self._ffprobe:
             return None
         try:
-            proc = subprocess.run(
+            proc = self._run(
                 [self._ffprobe, "-v", "error", "-show_entries", "format=duration",
                  "-of", "default=nw=1:nk=1", input_path],
-                capture_output=True, text=True, errors="replace",
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                capture_output=True,
             )
             if proc.returncode == 0:
                 try:
@@ -251,19 +244,14 @@ class VideoConverter:
         return None
 
     def _get_output_path(self, input_path: str) -> str:
-        """生成输出文件路径"""
+        """生成输出文件路径（输出目录留空则写到源文件所在目录）。"""
         stem = Path(input_path).stem
         ext = self.output_format
-
-        if self.output_dir:
-            return os.path.join(self.output_dir, f"{stem}.{ext}")
-        else:
-            # 输出到源文件目录（同格式转换已跳过，不会覆盖原文件）
-            parent = Path(input_path).parent
-            return os.path.join(parent, f"{stem}.{ext}")
+        base = self.output_dir or str(Path(input_path).parent)
+        return os.path.join(base, f"{stem}.{ext}")
 
     def _validate(self):
-        """编码器与容器兼容性预校验，返回错误信息字符串，None 表示通过"""
+        """编码器与容器兼容性预校验，返回错误信息字符串，None 表示通过。"""
         fmt, vc = self.output_format, self.video_codec
         if fmt == "webm" and vc not in WEBM_VIDEO_CODECS:
             return f"WebM 容器仅支持 VP9 视频编码，当前选择 {vc} 不兼容"
@@ -356,12 +344,7 @@ class VideoConverter:
         return cmd
 
     def _convert_single(self, video_path: str, on_start=None, on_progress=None) -> tuple:
-        """转换单个视频文件，返回 (路径, 状态, 信息)，状态: success/skipped/failed
-
-        Args:
-            on_start: 开始编码前的回调，接收 (文件路径)
-            on_progress: 编码中的实时进度回调，接收 (百分比, 已编码时间字符串)；百分比未知时为 None
-        """
+        """转换单个视频，返回 (路径, 状态, 信息)，状态: success/skipped/failed。"""
         try:
             # 编码器与容器兼容性校验
             error = self._validate()
@@ -441,40 +424,20 @@ class VideoConverter:
         except Exception as e:
             return video_path, "failed", str(e)
 
-    def convert(self, max_workers: int = 2, progress_callback=None, on_start=None, on_progress=None) -> dict:
-        """
-        批量转换视频
+    def convert(self, on_start=None, on_progress=None, on_done=None) -> dict:
+        """顺序转换全部视频，回调供 Cli 展示；返回分组结果 dict。"""
+        results = {"success": [], "skipped": [], "failed": [], "total": len(self.videos)}
 
-        Args:
-            max_workers: 并发线程数（视频编码为 CPU 密集型，建议 1）
-            progress_callback: 每个文件完成后的回调，接收 (已完成数, 总数)
-            on_start: 每个文件开始编码前的回调，接收 (文件路径)
-            on_progress: 每个文件编码中的实时进度回调，接收 (百分比, 已编码时间字符串)
-
-        Returns:
-            dict: 转换结果统计
-        """
-        total = len(self.videos)
-        results = {"success": [], "skipped": [], "failed": [], "total": total}
-
-        if total == 0:
-            return results
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(self._convert_single, path, on_start, on_progress): path
-                       for path in self.videos}
-
-            for idx, future in enumerate(as_completed(futures), 1):
-                path, status, info = future.result()
-                if status == "success":
-                    results["success"].append((path, info))
-                elif status == "skipped":
-                    results["skipped"].append((path, info))
-                else:
-                    results["failed"].append((path, info))
-
-                if progress_callback:
-                    progress_callback(idx, total)
+        for path in self.videos:
+            path, status, info = self._convert_single(path, on_start=on_start, on_progress=on_progress)
+            if status == "success":
+                results["success"].append((path, info))
+            elif status == "skipped":
+                results["skipped"].append((path, info))
+            else:
+                results["failed"].append((path, info))
+            if on_done:
+                on_done(path, status, info)
 
         return results
 
@@ -489,244 +452,297 @@ class VideoConverter:
         return f"{size:.1f} TB"
 
 
-def _render_html(config) -> str:
-    """读取 HTML 模板并注入 APP_DATA（常量单一来源在 Python）。"""
-    data = {
-        "saved": config,
-        "DEFAULTS": DEFAULT_CONFIG,
-        "VIDEO_FORMATS": VIDEO_FORMATS,
-        "VIDEO_CODEC_OPTIONS": VIDEO_CODEC_OPTIONS,
-        "RESOLUTION_OPTIONS": RESOLUTION_OPTIONS,
-        "QUALITY_OPTIONS": QUALITY_OPTIONS,
-        "FPS_OPTIONS": FPS_OPTIONS,
-        "AUDIO_MODE_OPTIONS": AUDIO_MODE_OPTIONS,
-    }
-    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-    html = TEMPLATE_PATH.read_text(encoding="utf-8")
-    return html.replace(APP_DATA_MARKER, f"const APP_DATA = {payload};")
+class Gui:
+    """webview-cli 配置窗口（含配置的读写与校验）。"""
 
+    @staticmethod
+    def _render(data):
+        """读取 HTML 模板并注入 APP_DATA（常量单一来源在 Python）。"""
+        payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+        html = CONFIG_TEMPLATE.read_text(encoding="utf-8")
+        return html.replace(APP_DATA_MARKER, f"const APP_DATA = {payload};")
 
-def _validate_saved(data):
-    """对页面返回的配置做二次校验（镜像 HTML 里的 JS 规则）。"""
-    if not isinstance(data, dict):
-        raise ValueError("返回的数据格式无效")
+    @staticmethod
+    def _webview_bin():
+        webview = shutil.which("webview-cli") or shutil.which("webview")
+        if not webview:
+            raise FileNotFoundError(
+                "未找到 webview-cli，请确认已安装并加入 PATH\n"
+                "https://github.com/just-be-dev/webview-cli"
+            )
+        return webview
 
-    fmt = str(data.get("format", "") or "").strip().lstrip(".").lower()
-    if fmt not in VIDEO_FORMATS:
-        raise ValueError(f"请选择有效的输出格式（支持：{', '.join(VIDEO_FORMATS)}）")
-    data["format"] = fmt  # 归一化后落盘
+    @staticmethod
+    def _validate(data):
+        """校验配置窗口返回的数据（镜像 HTML 里的 JS 规则），返回规范化后的 dict。"""
+        if not isinstance(data, dict):
+            raise ValueError("返回的数据格式无效")
 
-    if data.get("video_codec") not in ALLOWED_VIDEO_CODECS:
-        raise ValueError(f"无效的视频编码器：{data.get('video_codec')}")
-    if data.get("resolution") not in {"original", *RESOLUTIONS}:
-        raise ValueError(f"无效的分辨率：{data.get('resolution')}")
-    if data.get("quality") not in ALLOWED_QUALITIES:
-        raise ValueError(f"无效的画质：{data.get('quality')}")
-    if data.get("fps") not in ALLOWED_FPS:
-        raise ValueError(f"无效的帧率：{data.get('fps')}")
-    if data.get("audio_mode") not in ALLOWED_AUDIO_MODES:
-        raise ValueError(f"无效的音频模式：{data.get('audio_mode')}")
+        fmt = str(data.get("format") or "").strip().lstrip(".").lower()
+        if fmt not in VIDEO_FORMATS:
+            raise ValueError(f"请选择有效的输出格式（支持：{', '.join(VIDEO_FORMATS)}）")
+        data["format"] = fmt  # 归一化后落盘
 
+        if data.get("video_codec") not in ALLOWED_VIDEO_CODECS:
+            raise ValueError(f"无效的视频编码器：{data.get('video_codec')}")
+        if data.get("resolution") not in {"original", *RESOLUTIONS}:
+            raise ValueError(f"无效的分辨率：{data.get('resolution')}")
+        if data.get("quality") not in ALLOWED_QUALITIES:
+            raise ValueError(f"无效的画质：{data.get('quality')}")
+        if data.get("fps") not in ALLOWED_FPS:
+            raise ValueError(f"无效的帧率：{data.get('fps')}")
+        if data.get("audio_mode") not in ALLOWED_AUDIO_MODES:
+            raise ValueError(f"无效的音频模式：{data.get('audio_mode')}")
 
-def _write_config(data) -> Path:
-    data["overwrite"] = bool(data.get("overwrite"))
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    return CONFIG_PATH
+        data.update(
+            output_dir=str(data.get("output_dir") or "").strip(),
+            overwrite=bool(data.get("overwrite")),
+        )
+        # 补齐默认字段，保证 config.json 全字段、下游解析安全
+        for k, v in DEFAULT_CONFIG.items():
+            if k not in data:
+                data[k] = v
+        return data
 
-
-def _spawn_webview(base_cmd, html):
-    """先尝试 stdin 管道传入 HTML；失败则回退到临时 HTML 文件。
-
-    注意 webview 的输入优先级：非空 stdin 优先于位置参数。
-    """
-    common = dict(
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    try:
-        return subprocess.run([*base_cmd], input=html, **common)
-    except (OSError, ValueError):
-        fd, path = tempfile.mkstemp(suffix=".html", prefix="video-format-config-")
+    @staticmethod
+    def load_config():
+        """读取配置；缺失/损坏/非法返回 None（触发首次引导）。"""
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(html)
-            return subprocess.run([*base_cmd, path], input="", **common)
-        finally:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data if data.get("format") in VIDEO_FORMATS else None
 
-
-def run_config_window(config) -> bool:
-    """打开 HTML 配置窗口。返回 True 表示已保存配置，False 表示取消/出错。"""
-    webview = shutil.which("webview-cli") or shutil.which("webview")
-    if not webview:
-        raise FileNotFoundError(
-            "未找到 webview-cli，请确认已安装并加入 PATH\n"
-            "https://github.com/just-be-dev/webview-cli"
+    @staticmethod
+    def save_config(data):
+        CONFIG_PATH.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    html = _render_html(config)
-    base_cmd = [webview, "--title", "视频格式转换 - 配置窗口", "--width", "480", "--height", "720"]
-    proc = _spawn_webview(base_cmd, html)
-
-    if proc.returncode == 0:
+    def ask(self):
+        """打开配置窗口，返回校验后的配置 dict；取消/出错返回 None。"""
+        webview = self._webview_bin()
+        data = {"saved": self.load_config() or {},
+                "DEFAULTS": DEFAULT_CONFIG,
+                "VIDEO_FORMATS": VIDEO_FORMATS,
+                "VIDEO_CODEC_OPTIONS": VIDEO_CODEC_OPTIONS,
+                "RESOLUTION_OPTIONS": RESOLUTION_OPTIONS,
+                "QUALITY_OPTIONS": QUALITY_OPTIONS,
+                "FPS_OPTIONS": FPS_OPTIONS,
+                "AUDIO_MODE_OPTIONS": AUDIO_MODE_OPTIONS}
+        html = self._render(data)
+        cmd = [webview, "--title", "视频格式转换 - 配置窗口", "--width", "480", "--height", "720"]
         try:
-            data = json.loads(proc.stdout)
-        except ValueError as e:
-            print(f"配置窗口返回的数据无法解析：{e}")
-            return False
+            proc = VideoConverter._run(cmd, input=html, capture_output=True)
+        except (OSError, ValueError):
+            # stdin 管道不可用时回退到临时 HTML 文件
+            fd, path = tempfile.mkstemp(suffix=".html", prefix="video-format-webview-")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(html)
+                proc = VideoConverter._run(cmd + [path], input="", capture_output=True)
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        if proc.returncode:
+            if proc.returncode != 2 and (proc.stderr or "").strip():
+                print((proc.stderr or "").strip())
+            return None  # 取消(2) / 出错
         try:
-            _validate_saved(data)
+            payload = json.loads(proc.stdout)
+        except ValueError:
+            print("配置窗口返回的数据无法解析")
+            return None
+        try:
+            return self._validate(payload)
         except (ValueError, TypeError) as e:
             print(f"配置校验失败：{e}")
-            return False
-        _write_config(data)
-        return True
-    elif proc.returncode == 2:
-        return False  # 用户直接关窗 = 取消
-    else:
-        # reject(1) / 超时(3) / 用法错误(64)
-        msg = (proc.stderr or "").strip()
-        if msg:
-            print(msg)
-        return False
+            return None
 
 
-def load_config():
-    """加载配置文件，不存在则返回默认配置。"""
-    config = dict(DEFAULT_CONFIG)
-    if CONFIG_PATH.exists():
+class Cli:
+    """批处理命令行流程（含盒子参数解析与输出编码修复）。"""
+
+    @staticmethod
+    def _fix_encoding():
+        # 统一输出编码，避免 GBK 控制台下 emoji/中文报错（盒子环境已设 PYTHONUTF8=1）
+        for _s in (sys.stdout, sys.stderr):
+            try:
+                _s.reconfigure(encoding="utf-8", errors="replace")
+            except (AttributeError, ValueError):
+                pass
+
+    @staticmethod
+    def _dw(text):
+        """近似显示宽度：CJK/全角/emoji 计 2，其余计 1（横幅自适应宽度用）。"""
+        return sum(2 if ord(ch) > 0x2E7F else 1 for ch in text)
+
+    @staticmethod
+    def _version():
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                config.update(json.load(f))
-        except Exception:
+            for line in (BASE_DIR / "bm-scripts-box-rc.toml").read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("version"):
+                    return line.split("=", 1)[1].strip().strip('"')
+        except OSError:
             pass
-    return config
+        return ""
 
+    @staticmethod
+    def _title():
+        v = Cli._version()
+        return f"🎬 视频格式转换{(' v' + v) if v else ''} · 基于 FFmpeg 批量互转"
 
-def get_path(param_path):
-    initial_files = []
+    @staticmethod
+    def _banner(text):
+        w = Cli._dw(text) + 4
+        bar = "─" * w
+        print("┌" + bar + "┐")
+        print("│  " + text + "  │")
+        print("└" + bar + "┘")
 
-    if param_path and Path(param_path).exists():
-        with open(param_path, "r", encoding="utf-8") as f:
-            params = json.load(f)
+    @staticmethod
+    def _section(title):
+        print(f"── {title} " + "─" * 22)
+
+    @staticmethod
+    def get_path(param_path):
+        """解析盒子传入的 JSON 参数文件，返回存在的视频路径列表。"""
+        if not (param_path and Path(param_path).exists()):
+            return []
+        try:
+            with open(param_path, "r", encoding="utf-8") as f:
+                params = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return []
         raw = params.get("data", {}).get("target_paths", [])
-        initial_files = [p for p in raw if Path(p).exists()]
-    return initial_files
+        return [p for p in raw if Path(p).exists()]
 
+    def _config_summary(self, config):
+        """转换参数摘要（配置分节说明用，两行）。"""
+        vc = {"auto": "自动", "libx264": "H.264", "libx265": "H.265", "libvpx-vp9": "VP9", "mpeg4": "MPEG-4"}
+        res = {"original": "原始", "480p": "480p", "720p": "720p", "1080p": "1080p"}
+        q = {"best": "最佳", "high": "高", "standard": "标准", "low": "较低", "small": "最小"}
+        fps_map = {"original": "原始", "24": "24", "25": "25", "30": "30", "50": "50", "60": "60"}
+        audio = {"copy": "保留原音轨", "encode": "重新编码", "none": "移除音轨"}
+        line1 = (f"🎞️ 输出 {config.get('format')} · 编码 {vc.get(config.get('video_codec'), config.get('video_codec'))}"
+                 f" · 分辨率 {res.get(config.get('resolution'), config.get('resolution'))}"
+                 f" · 画质 {q.get(config.get('quality'), config.get('quality'))}"
+                 f" · 帧率 {fps_map.get(config.get('fps'), config.get('fps'))}"
+                 f" · 音频 {audio.get(config.get('audio_mode'), config.get('audio_mode'))}")
+        out = config.get("output_dir") or "源文件所在目录"
+        mode = "允许覆盖" if config.get("overwrite") else "跳过已存在文件"
+        return f"{line1}\n  📁 输出目录 {out} · {mode}"
 
-def get_config():
-    """读取配置文件，不存在则返回默认配置"""
-    config_path = Path(__file__).parent / "config.json"
+    def run(self, paths):
+        """批处理主流程：扫描 → 配置 → 处理 → 结果 → 倒计时退出。"""
+        Cli._banner(Cli._title())
 
-    # 默认配置（单一来源在 scr/gui.py）
-    default_config = dict(DEFAULT_CONFIG)
+        videos, skipped = [], []
+        for p in paths:
+            if Path(p).suffix.lower() in VIDEO_EXTS:
+                videos.append(p)
+            else:
+                skipped.append(p)
+        if skipped:
+            self._section("扫描")
+            for p in skipped:
+                print(f"  ⏭️ 忽略非视频: {Path(p).name}")
 
-    if not os.path.exists(config_path):
-        return default_config
+        if not videos:
+            print("  ❌ 未选择有效的视频文件")
+            self._exit()
+            return
 
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-            return {**default_config, **config}
-    except (json.JSONDecodeError, ValueError) as e:
-        print(f"配置文件格式错误：{e}，使用默认配置")
-        return default_config
-
-
-def _format_param(value, mapping=None):
-    """格式化参数显示值"""
-    if mapping and value in mapping:
-        return mapping[value]
-    return value
-
-
-def cli(video_path: list, config: dict):
-    vc_map = {"auto": "自动(随格式)", "libx264": "H.264", "libx265": "H.265/HEVC",
-              "libvpx-vp9": "VP9", "mpeg4": "MPEG-4"}
-    res_map = {"original": "跟随输入", "480p": "480p", "720p": "720p", "1080p": "1080p"}
-    q_map = {"best": "最佳", "high": "高", "standard": "标准", "low": "较低", "small": "最小"}
-    fps_map = {"original": "跟随输入", "24": "24", "25": "25", "30": "30",
-               "50": "50", "60": "60"}
-    audio_map = {"copy": "保留原音轨", "encode": "重新编码", "none": "移除音轨"}
-
-    print("-" * 50)
-    print('视频格式转换')
-    print("-" * 50)
-    print(f"输出格式: {config['format']}   视频编码: {_format_param(config['video_codec'], vc_map)}"
-          f"   分辨率: {_format_param(config['resolution'], res_map)}")
-    print(f"画质: {_format_param(config['quality'], q_map)}   帧率: {_format_param(config['fps'], fps_map)}"
-          f"   音频: {_format_param(config['audio_mode'], audio_map)}")
-    print(f"输出目录: {config['output_dir'] if config['output_dir'] else '源文件所在目录'}"
-          f"   覆盖模式: {'允许覆盖' if config['overwrite'] else '跳过已存在文件'}")
-    print("-" * 50)
-
-    converter = VideoConverter(
-        videos=video_path,
-        output_dir=config["output_dir"],
-        output_format=config["format"],
-        video_codec=config["video_codec"],
-        resolution=config["resolution"],
-        quality=config["quality"],
-        fps=config["fps"],
-        audio_mode=config["audio_mode"],
-        overwrite=bool(config["overwrite"]),
-    )
-
-    total_files = len(video_path)
-    started = [0]
-
-    def on_start(path):
-        started[0] += 1
-        print(f"\n▶ 正在转换 ({started[0]}/{total_files}): {os.path.basename(path)}")
-
-    def on_progress(pct, time_str):
-        if pct is not None:
-            print(f"\r   进度: {pct:5.1f}%   已编码 {time_str}", end="", flush=True)
+        self._section("配置")
+        config = Gui.load_config()
+        if config is None:
+            print("  📋 首次使用，请配置转换参数...")
+            config = Gui().ask()
+            if config is None:
+                print("  ❌ 未获取到配置，已取消转换")
+                self._exit()
+                return
+            Gui.save_config(config)
+            print("  ✅ 配置已保存")
         else:
-            print(f"\r   进度: ...   已编码 {time_str}", end="", flush=True)
+            print("  💾 使用已保存的配置")
+        print(f"  {self._config_summary(config)}")
 
-    # 视频编码为 CPU 密集型任务，顺序转换可吃满单核且进度清晰
-    result = converter.convert(max_workers=1, on_start=on_start, on_progress=on_progress)
+        self._section("处理")
+        total = len(videos)
+        started = [0]
 
-    print("\n")
-    print(f"✅ 成功：{len(result['success'])} 个")
-    for path, output in result["success"]:
-        print(f"   {os.path.basename(path)} → {os.path.basename(output)}")
+        def on_start(path):
+            started[0] += 1
+            print(f"  ▶ ({started[0]}/{total}) 正在转换: {Path(path).name}")
 
-    if result["skipped"]:
-        print(f"\n⏭️ 跳过：{len(result['skipped'])} 个")
-        for path, reason in result["skipped"]:
-            print(f"   {os.path.basename(path)}：{reason}")
+        def on_progress(pct, time_str):
+            if pct is not None:
+                print(f"\r    进度: {pct:5.1f}%  已编码 {time_str}", end="", flush=True)
+            else:
+                print(f"\r    进度: ...  已编码 {time_str}", end="", flush=True)
 
-    if result["failed"]:
-        print(f"\n❌ 失败：{len(result['failed'])} 个")
-        for path, error in result["failed"]:
-            print(f"   {os.path.basename(path)}：{error}")
+        def on_done(path, status, info):
+            print("\r" + " " * 60, end="\r")
+            name = Path(path).name
+            if status == "success":
+                size = VideoConverter.get_file_size(info)
+                print(f"  ✅ {name} → {Path(info).name}（{size}）")
+            elif status == "skipped":
+                print(f"  ⏭️ {name}  {info}")
+            else:
+                print(f"  ❌ {name}  {(info or '未知错误').strip().splitlines()[0]}")
 
-    # ── 倒计时 + 按键退出 ──
-    print("\n" + "-" * 50)
-    print("按任意键立即退出，或等待倒计时自动退出")
+        converter = VideoConverter(videos, config)
+        result = converter.convert(on_start=on_start, on_progress=on_progress, on_done=on_done)
 
-    # 倒计时
-    for i in range(5, 0, -1):
-        print(f"\r⏳ {i} 秒后自动退出... (按任意键退出)", end="")
-        time.sleep(1)
-    print("\r👋 已退出")
-    sys.exit(0)
+        self._section("结果")
+        parts = [f"✅ 成功 {len(result['success'])} 个"]
+        if result["skipped"]:
+            parts.append(f"⏭️ 跳过 {len(result['skipped'])} 个")
+        if result["failed"]:
+            parts.append(f"❌ 失败 {len(result['failed'])} 个")
+        print("  " + " · ".join(parts))
+        self._exit()
+
+    @staticmethod
+    def _exit():
+        width, total = 10, 5
+        for i in range(total, 0, -1):
+            filled = round(width * (total - i + 1) / total)
+            bar = "█" * filled + "░" * (width - filled)
+            print(f"\r  ⏳ {i}s {bar}  按任意键立即退出", end="")
+            time.sleep(1)
+        print("\r" + " " * 60, end="\r")
+        print("  👋 已退出")
+        sys.exit(0)
 
 
 def main():
+    Cli._fix_encoding()                      # 先修编码，再打印任何东西
     param_path = sys.argv[1] if len(sys.argv) > 1 else None
-    config = get_config()
-    if param_path:
-        paths = get_path(param_path)
-        cli(paths, config)
-    else:
-        run_config_window(config)
+    try:
+        if param_path:                        # 盒子传入 JSON 参数 → 批处理
+            paths = Cli.get_path(param_path)
+            if not paths:
+                print("未获取到有效的文件路径")
+                time.sleep(2)
+            else:
+                Cli().run(paths)
+        else:                                 # 无参 → 打开配置窗口
+            Cli._banner(Cli._title())
+            config = Gui().ask()
+            if config is not None:
+                Gui.save_config(config)
+            print(("  ✅ 配置已保存" if config else "  未保存配置") + "\n")
+            time.sleep(2)
+    except FileNotFoundError as e:            # 缺二进制/webview → 中文报错，停留 3 秒
+        print(f"❌ {e}")
+        time.sleep(3)
 
 
 if __name__ == "__main__":
