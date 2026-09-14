@@ -3,16 +3,16 @@
 [bmscriptsbox.info]
 id = "b7e730b1-1bb3-418d-a90a-4691ca600c9b"
 name = "视频格式转换"
-desc = "基于 FFmpeg 的视频格式转换脚本 | 支持 mp4/mkv/avi/mov/webm/gif/m4v/flv/wmv/ts 10 种输出格式，可自定义视频编码器、分辨率、画质、帧率与音频处理方式，右键一键批量转换"
-version = "1.2.0"
+desc = "视频格式转换脚本 | 基于 FFmpeg，支持 MP4/MKV/AVI/MOV/WEBM/GIF/M4V/FLV/WMV/TS 10 种格式互转，可调视频编码器、分辨率、画质、帧率与音频处理 | 右键批量一键转换，支持定时任务与节点联动"
+version = "2.1.0"
 icon = "./imgs/img.png"
 
 [bmscriptsbox.runtime]
 language = "python"
 language_version = ">=3.8"
 entry = "main.py"
-terminal = "inverse"
-binaries = [{name = "ffmpeg"}, {name="webview-cli"}]
+terminal = "always"
+binaries = [{name = "ffmpeg"}]
 
 [bmscriptsbox.triggers.context_menu]
 enabled = true
@@ -26,8 +26,114 @@ input_type = "files"
 filters = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".ts", ".m4v",
            ".mpg", ".mpeg", ".m2ts", ".mts", ".3gp", ".ogv", ".vob", ".rmvb", ".rm", ".asf"]
 
+# ── 主数据：选中的视频文件（右键/快捷键带入，或界面选择） ──
 [[bmscriptsbox.inputs]]
 name = "target_paths"
+label = "源视频文件"
 type = "list"
 exts = [".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".wmv", ".ts", ".m4v",
         ".mpg", ".mpeg", ".m2ts", ".mts", ".3gp", ".ogv", ".vob", ".rmvb", ".rm", ".asf"]
+pick = "both"
+description = "要转换的视频文件；选择文件夹时扫描其下的视频文件（不递归）"
+
+# ── 节点输出：信封顶层平铺的业务键 ──
+[[bmscriptsbox.outputs]]
+name = "output_paths"
+type = "list"
+description = "成功转换后的输出文件路径列表"
+
+[[bmscriptsbox.outputs]]
+name = "skipped_paths"
+type = "list"
+description = "跳过的输入文件路径列表（同格式或已存在）"
+
+[[bmscriptsbox.outputs]]
+name = "failed_paths"
+type = "list"
+description = "转换失败的输入文件路径列表"
+
+[[bmscriptsbox.outputs]]
+name = "summary"
+type = "str"
+description = "转换结果摘要文本"
+
+# ── 运行参数：自动生成界面 / 定时任务表单的字段 ──
+[[bmscriptsbox.params]]
+name = "format"
+label = "输出格式"
+type = "str"
+default = "mp4"
+choices = ["mp4", "mkv", "avi", "mov", "webm", "gif", "m4v", "flv", "wmv", "ts"]
+choice_labels = { mp4 = "MP4", mkv = "MKV", avi = "AVI", mov = "MOV", webm = "WEBM", gif = "GIF", m4v = "M4V", flv = "FLV", wmv = "WMV", ts = "TS" }
+description = "输出容器格式"
+
+[[bmscriptsbox.params]]
+name = "video_codec"
+label = "视频编码器"
+type = "str"
+default = "auto"
+choices = ["auto", "libx264", "libx265", "libvpx-vp9", "mpeg4"]
+choice_labels = { auto = "自动 (跟随格式)", libx264 = "H.264 (兼容性最佳)", libx265 = "H.265/HEVC (高压缩)", "libvpx-vp9" = "VP9 (WebM 常用)", mpeg4 = "MPEG-4 (兼容老设备)" }
+description = "视频编码器，auto 跟随容器推荐"
+
+[[bmscriptsbox.params]]
+name = "resolution"
+label = "分辨率"
+type = "str"
+default = "original"
+choices = ["original", "480p", "720p", "1080p"]
+choice_labels = { original = "原始 (跟随输入)", "480p" = "480p (标清)", "720p" = "720p (高清)", "1080p" = "1080p (全高清)" }
+description = "输出分辨率，original 跟随输入"
+
+[[bmscriptsbox.params]]
+name = "quality"
+label = "画质"
+type = "str"
+default = "standard"
+choices = ["best", "high", "standard", "low", "small"]
+choice_labels = { best = "最佳 (CRF 18)", high = "高 (CRF 20)", standard = "标准 (CRF 23)", low = "较低 (CRF 26)", small = "最小 (CRF 28)" }
+description = "画质档位（CRF 越小越好）"
+
+[[bmscriptsbox.params]]
+name = "fps"
+label = "帧率"
+type = "str"
+default = "original"
+choices = ["original", "24", "25", "30", "50", "60"]
+choice_labels = { original = "原始 (跟随输入)", "24" = "24 fps", "25" = "25 fps", "30" = "30 fps", "50" = "50 fps", "60" = "60 fps" }
+description = "输出帧率，original 跟随输入"
+
+[[bmscriptsbox.params]]
+name = "audio_mode"
+label = "音频处理"
+type = "str"
+default = "copy"
+choices = ["copy", "encode", "none"]
+choice_labels = { copy = "保留原音轨 (最快)", encode = "重新编码 (推荐编码器)", none = "移除音轨" }
+description = "音频处理方式"
+
+[[bmscriptsbox.params]]
+name = "output_dir"
+label = "输出目录"
+type = "str"
+default = ""
+description = "留空则输出到源文件所在目录"
+
+[[bmscriptsbox.params]]
+name = "overwrite"
+label = "覆盖已存在文件"
+type = "bool"
+default = false
+description = "开启后覆盖同名输出文件，否则跳过"
+
+# ── 节点声明：可被其他脚本通过 /api/link 联动调用 ──
+[bmscriptsbox.node]
+enabled = true
+
+# ── 定时任务声明：可无人值守、仅凭 params 运行 ──
+[bmscriptsbox.schedule]
+enabled = true
+
+# ── 盒子自动生成运行界面 ──
+[bmscriptsbox.params_form]
+enabled = true

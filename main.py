@@ -1,23 +1,21 @@
 """
-视频格式转换 - 支持多种视频格式互转
+视频格式转换 - 基于 FFmpeg 的批量格式互转
 支持格式: MP4 | MKV | AVI | MOV | WEBM | GIF | M4V | FLV | WMV | TS
+
+界面、定时任务与节点联动均由「不忙脚本盒子」提供：
+- 手动触发：盒子依据 TOML 的 params 自动生成表单，用户填写后运行
+- 定时任务：invoke_mode == "scheduled"，仅凭 params 无人值守运行
+- 节点联动：invoke_mode == "node"，转换完成后把信封写入 output_json
 """
 import json
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
-import time
+import urllib.request
 from pathlib import Path
 from typing import List
-
-# ── 路径与模板 ──
-BASE_DIR = Path(__file__).parent
-CONFIG_PATH = BASE_DIR / "config.json"
-CONFIG_TEMPLATE = BASE_DIR / "config.html"
-APP_DATA_MARKER = "/*__APP_DATA__*/"
 
 # ==================== 视频格式定义 ====================
 # 所有输出格式
@@ -106,45 +104,7 @@ WMV_VIDEO_CODECS = {"auto", "wmv2"}
 GIF_DEFAULT_FPS = "15"
 GIF_MAX_WIDTH = 480
 
-# 下拉选项的显示文案（dict 顺序即下拉顺序）
-VIDEO_CODEC_OPTIONS = {
-    "auto": "自动 (跟随格式)",
-    "libx264": "H.264 (兼容性最佳)",
-    "libx265": "H.265/HEVC (高压缩)",
-    "libvpx-vp9": "VP9 (WebM 常用)",
-    "mpeg4": "MPEG-4 (兼容老设备)",
-}
-
-RESOLUTION_OPTIONS = {
-    "original": "原始 (跟随输入)",
-    "480p": "480p (标清)",
-    "720p": "720p (高清)",
-    "1080p": "1080p (全高清)",
-}
-
-QUALITY_OPTIONS = {
-    "best": "最佳 (CRF 18)",
-    "high": "高 (CRF 20)",
-    "standard": "标准 (CRF 23)",
-    "low": "较低 (CRF 26)",
-    "small": "最小 (CRF 28)",
-}
-
-FPS_OPTIONS = {
-    "original": "原始 (跟随输入)",
-    "24": "24 fps",
-    "25": "25 fps",
-    "30": "30 fps",
-    "50": "50 fps",
-    "60": "60 fps",
-}
-
-AUDIO_MODE_OPTIONS = {
-    "copy": "保留原音轨 (最快)",
-    "encode": "重新编码 (推荐编码器)",
-    "none": "移除音轨",
-}
-
+# 默认配置（params 缺省时的兜底，与 TOML 的 default 保持一致）
 DEFAULT_CONFIG = {
     "format": "mp4",
     "output_dir": "",
@@ -175,7 +135,7 @@ class VideoConverter:
 
     @staticmethod
     def _require_binaries():
-        """同时校验 ffmpeg 与 ffprobe，缺则直接报错（供 Cli 开局预检）。"""
+        """同时校验 ffmpeg 与 ffprobe，缺则直接报错（供开局预检）。"""
         if not shutil.which("ffmpeg"):
             raise FileNotFoundError("未找到 FFmpeg，请安装并加入环境变量 PATH（https://ffmpeg.org/download.html）")
         if not shutil.which("ffprobe"):
@@ -425,7 +385,7 @@ class VideoConverter:
             return video_path, "failed", str(e)
 
     def convert(self, on_start=None, on_progress=None, on_done=None) -> dict:
-        """顺序转换全部视频，回调供 Cli 展示；返回分组结果 dict。"""
+        """顺序转换全部视频，回调供展示；返回分组结果 dict。"""
         results = {"success": [], "skipped": [], "failed": [], "total": len(self.videos)}
 
         for path in self.videos:
@@ -452,297 +412,185 @@ class VideoConverter:
         return f"{size:.1f} TB"
 
 
-class Gui:
-    """webview-cli 配置窗口（含配置的读写与校验）。"""
+# ==================== 盒子契约辅助 ====================
 
-    @staticmethod
-    def _render(data):
-        """读取 HTML 模板并注入 APP_DATA（常量单一来源在 Python）。"""
-        payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-        html = CONFIG_TEMPLATE.read_text(encoding="utf-8")
-        return html.replace(APP_DATA_MARKER, f"const APP_DATA = {payload};")
+def _fix_encoding():
+    """统一输出编码，避免 GBK 控制台下 emoji/中文报错（盒子环境已设 PYTHONUTF8=1）。"""
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
 
-    @staticmethod
-    def _webview_bin():
-        webview = shutil.which("webview-cli") or shutil.which("webview")
-        if not webview:
-            raise FileNotFoundError(
-                "未找到 webview-cli，请确认已安装并加入 PATH\n"
-                "https://github.com/just-be-dev/webview-cli"
-            )
-        return webview
 
-    @staticmethod
-    def _validate(data):
-        """校验配置窗口返回的数据（镜像 HTML 里的 JS 规则），返回规范化后的 dict。"""
-        if not isinstance(data, dict):
-            raise ValueError("返回的数据格式无效")
+def _config_from_params(params: dict) -> dict:
+    """从 params 段提取转换配置，缺失项回退默认值。"""
+    config = dict(DEFAULT_CONFIG)
+    for key in DEFAULT_CONFIG:
+        if key in params and params[key] is not None:
+            config[key] = params[key]
+    config["overwrite"] = bool(config.get("overwrite"))
+    return config
 
-        fmt = str(data.get("format") or "").strip().lstrip(".").lower()
-        if fmt not in VIDEO_FORMATS:
-            raise ValueError(f"请选择有效的输出格式（支持：{', '.join(VIDEO_FORMATS)}）")
-        data["format"] = fmt  # 归一化后落盘
 
-        if data.get("video_codec") not in ALLOWED_VIDEO_CODECS:
-            raise ValueError(f"无效的视频编码器：{data.get('video_codec')}")
-        if data.get("resolution") not in {"original", *RESOLUTIONS}:
-            raise ValueError(f"无效的分辨率：{data.get('resolution')}")
-        if data.get("quality") not in ALLOWED_QUALITIES:
-            raise ValueError(f"无效的画质：{data.get('quality')}")
-        if data.get("fps") not in ALLOWED_FPS:
-            raise ValueError(f"无效的帧率：{data.get('fps')}")
-        if data.get("audio_mode") not in ALLOWED_AUDIO_MODES:
-            raise ValueError(f"无效的音频模式：{data.get('audio_mode')}")
+def _collect_inputs(data: dict) -> List[str]:
+    """汇总输入路径：主数据 target_paths；目录则扫描其下的视频文件（不递归）。去重且只保留存在的文件。"""
+    target = data.get("target_paths") or []
+    raw = [target] if isinstance(target, str) else list(target)
 
-        data.update(
-            output_dir=str(data.get("output_dir") or "").strip(),
-            overwrite=bool(data.get("overwrite")),
+    paths, seen = [], set()
+
+    def _add(p):
+        try:
+            key = os.path.normcase(os.path.abspath(p))
+        except (OSError, TypeError):
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        path = Path(p)
+        if path.is_file():
+            paths.append(str(path))
+
+    for p in raw:
+        try:
+            key = os.path.normcase(os.path.abspath(p))
+        except (OSError, TypeError):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        path = Path(p)
+        if path.is_file():
+            paths.append(str(path))
+        elif path.is_dir():
+            # 选择文件夹：扫描其下的视频文件（不递归）
+            for entry in sorted(path.iterdir()):
+                if entry.is_file() and entry.suffix.lower() in VIDEO_EXTS:
+                    _add(str(entry))
+    return paths
+
+
+def _notify(api_base, notify_type: str, message: str):
+    """通过盒子 HTTP API 发送桌面通知（best-effort，失败静默）。"""
+    if not api_base or not message:
+        return
+    try:
+        body = json.dumps(
+            {"notify_type": notify_type, "message": message}, ensure_ascii=False
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{api_base}/api/notify", data=body,
+            headers={"Content-Type": "application/json"},
         )
-        # 补齐默认字段，保证 config.json 全字段、下游解析安全
-        for k, v in DEFAULT_CONFIG.items():
-            if k not in data:
-                data[k] = v
-        return data
+        urllib.request.urlopen(req, timeout=5).close()
+    except Exception:
+        pass
 
-    @staticmethod
-    def load_config():
-        """读取配置；缺失/损坏/非法返回 None（触发首次引导）。"""
+
+def _finish(env: dict, envelope: dict, notify_type: str):
+    """收尾：节点/定时任务写回信封，普通触发发送桌面通知。"""
+    invoke_mode = env.get("invoke_mode", "manual")
+
+    output_json = env.get("output_json")
+    if output_json:
         try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        if not isinstance(data, dict):
-            return None
-        return data if data.get("format") in VIDEO_FORMATS else None
-
-    @staticmethod
-    def save_config(data):
-        CONFIG_PATH.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-
-    def ask(self):
-        """打开配置窗口，返回校验后的配置 dict；取消/出错返回 None。"""
-        webview = self._webview_bin()
-        data = {"saved": self.load_config() or {},
-                "DEFAULTS": DEFAULT_CONFIG,
-                "VIDEO_FORMATS": VIDEO_FORMATS,
-                "VIDEO_CODEC_OPTIONS": VIDEO_CODEC_OPTIONS,
-                "RESOLUTION_OPTIONS": RESOLUTION_OPTIONS,
-                "QUALITY_OPTIONS": QUALITY_OPTIONS,
-                "FPS_OPTIONS": FPS_OPTIONS,
-                "AUDIO_MODE_OPTIONS": AUDIO_MODE_OPTIONS}
-        html = self._render(data)
-        cmd = [webview, "--title", "视频格式转换 - 配置窗口", "--width", "480", "--height", "720"]
-        try:
-            proc = VideoConverter._run(cmd, input=html, capture_output=True)
-        except (OSError, ValueError):
-            # stdin 管道不可用时回退到临时 HTML 文件
-            fd, path = tempfile.mkstemp(suffix=".html", prefix="video-format-webview-")
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(html)
-                proc = VideoConverter._run(cmd + [path], input="", capture_output=True)
-            finally:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-        if proc.returncode:
-            if proc.returncode != 2 and (proc.stderr or "").strip():
-                print((proc.stderr or "").strip())
-            return None  # 取消(2) / 出错
-        try:
-            payload = json.loads(proc.stdout)
-        except ValueError:
-            print("配置窗口返回的数据无法解析")
-            return None
-        try:
-            return self._validate(payload)
-        except (ValueError, TypeError) as e:
-            print(f"配置校验失败：{e}")
-            return None
-
-
-class Cli:
-    """批处理命令行流程（含盒子参数解析与输出编码修复）。"""
-
-    @staticmethod
-    def _fix_encoding():
-        # 统一输出编码，避免 GBK 控制台下 emoji/中文报错（盒子环境已设 PYTHONUTF8=1）
-        for _s in (sys.stdout, sys.stderr):
-            try:
-                _s.reconfigure(encoding="utf-8", errors="replace")
-            except (AttributeError, ValueError):
-                pass
-
-    @staticmethod
-    def _dw(text):
-        """近似显示宽度：CJK/全角/emoji 计 2，其余计 1（横幅自适应宽度用）。"""
-        return sum(2 if ord(ch) > 0x2E7F else 1 for ch in text)
-
-    @staticmethod
-    def _version():
-        try:
-            for line in (BASE_DIR / "bm-scripts-box-rc.toml").read_text(encoding="utf-8").splitlines():
-                if line.strip().startswith("version"):
-                    return line.split("=", 1)[1].strip().strip('"')
+            with open(output_json, "w", encoding="utf-8") as f:
+                json.dump(envelope, f, ensure_ascii=False, indent=2)
         except OSError:
             pass
-        return ""
 
-    @staticmethod
-    def _title():
-        v = Cli._version()
-        return f"🎬 视频格式转换{(' v' + v) if v else ''} · 基于 FFmpeg 批量互转"
+    if invoke_mode != "node":
+        _notify(env.get("api_base"), notify_type, envelope.get("summary") or envelope.get("msg"))
 
-    @staticmethod
-    def _banner(text):
-        w = Cli._dw(text) + 4
-        bar = "─" * w
-        print("┌" + bar + "┐")
-        print("│  " + text + "  │")
-        print("└" + bar + "┘")
 
-    @staticmethod
-    def _section(title):
-        print(f"── {title} " + "─" * 22)
-
-    @staticmethod
-    def get_path(param_path):
-        """解析盒子传入的 JSON 参数文件，返回存在的视频路径列表。"""
-        if not (param_path and Path(param_path).exists()):
-            return []
-        try:
-            with open(param_path, "r", encoding="utf-8") as f:
-                params = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return []
-        raw = params.get("data", {}).get("target_paths", [])
-        return [p for p in raw if Path(p).exists()]
-
-    def _config_summary(self, config):
-        """转换参数摘要（配置分节说明用，两行）。"""
-        vc = {"auto": "自动", "libx264": "H.264", "libx265": "H.265", "libvpx-vp9": "VP9", "mpeg4": "MPEG-4"}
-        res = {"original": "原始", "480p": "480p", "720p": "720p", "1080p": "1080p"}
-        q = {"best": "最佳", "high": "高", "standard": "标准", "low": "较低", "small": "最小"}
-        fps_map = {"original": "原始", "24": "24", "25": "25", "30": "30", "50": "50", "60": "60"}
-        audio = {"copy": "保留原音轨", "encode": "重新编码", "none": "移除音轨"}
-        line1 = (f"🎞️ 输出 {config.get('format')} · 编码 {vc.get(config.get('video_codec'), config.get('video_codec'))}"
-                 f" · 分辨率 {res.get(config.get('resolution'), config.get('resolution'))}"
-                 f" · 画质 {q.get(config.get('quality'), config.get('quality'))}"
-                 f" · 帧率 {fps_map.get(config.get('fps'), config.get('fps'))}"
-                 f" · 音频 {audio.get(config.get('audio_mode'), config.get('audio_mode'))}")
-        out = config.get("output_dir") or "源文件所在目录"
-        mode = "允许覆盖" if config.get("overwrite") else "跳过已存在文件"
-        return f"{line1}\n  📁 输出目录 {out} · {mode}"
-
-    def run(self, paths):
-        """批处理主流程：扫描 → 配置 → 处理 → 结果 → 倒计时退出。"""
-        Cli._banner(Cli._title())
-
-        videos, skipped = [], []
-        for p in paths:
-            if Path(p).suffix.lower() in VIDEO_EXTS:
-                videos.append(p)
-            else:
-                skipped.append(p)
-        if skipped:
-            self._section("扫描")
-            for p in skipped:
-                print(f"  ⏭️ 忽略非视频: {Path(p).name}")
-
-        if not videos:
-            print("  ❌ 未选择有效的视频文件")
-            self._exit()
-            return
-
-        self._section("配置")
-        config = Gui.load_config()
-        if config is None:
-            print("  📋 首次使用，请配置转换参数...")
-            config = Gui().ask()
-            if config is None:
-                print("  ❌ 未获取到配置，已取消转换")
-                self._exit()
-                return
-            Gui.save_config(config)
-            print("  ✅ 配置已保存")
-        else:
-            print("  💾 使用已保存的配置")
-        print(f"  {self._config_summary(config)}")
-
-        self._section("处理")
-        total = len(videos)
-        started = [0]
-
-        def on_start(path):
-            started[0] += 1
-            print(f"  ▶ ({started[0]}/{total}) 正在转换: {Path(path).name}")
-
-        def on_progress(pct, time_str):
-            if pct is not None:
-                print(f"\r    进度: {pct:5.1f}%  已编码 {time_str}", end="", flush=True)
-            else:
-                print(f"\r    进度: ...  已编码 {time_str}", end="", flush=True)
-
-        def on_done(path, status, info):
-            print("\r" + " " * 60, end="\r")
-            name = Path(path).name
-            if status == "success":
-                size = VideoConverter.get_file_size(info)
-                print(f"  ✅ {name} → {Path(info).name}（{size}）")
-            elif status == "skipped":
-                print(f"  ⏭️ {name}  {info}")
-            else:
-                print(f"  ❌ {name}  {(info or '未知错误').strip().splitlines()[0]}")
-
-        converter = VideoConverter(videos, config)
-        result = converter.convert(on_start=on_start, on_progress=on_progress, on_done=on_done)
-
-        self._section("结果")
-        parts = [f"✅ 成功 {len(result['success'])} 个"]
-        if result["skipped"]:
-            parts.append(f"⏭️ 跳过 {len(result['skipped'])} 个")
-        if result["failed"]:
-            parts.append(f"❌ 失败 {len(result['failed'])} 个")
-        print("  " + " · ".join(parts))
-        self._exit()
-
-    @staticmethod
-    def _exit():
-        width, total = 10, 5
-        for i in range(total, 0, -1):
-            filled = round(width * (total - i + 1) / total)
-            bar = "█" * filled + "░" * (width - filled)
-            print(f"\r  ⏳ {i}s {bar}  按任意键立即退出", end="")
-            time.sleep(1)
-        print("\r" + " " * 60, end="\r")
-        print("  👋 已退出")
-        sys.exit(0)
+def _fail(env: dict, message: str):
+    """构造失败信封并收尾。"""
+    print(f"❌ {message}")
+    envelope = {
+        "code": 1, "msg": message, "summary": message,
+        "output_paths": [], "skipped_paths": [], "failed_paths": [],
+    }
+    _finish(env, envelope, "error")
 
 
 def main():
-    Cli._fix_encoding()                      # 先修编码，再打印任何东西
-    param_path = sys.argv[1] if len(sys.argv) > 1 else None
+    _fix_encoding()
+
+    if len(sys.argv) < 2:
+        print("请通过「不忙脚本盒子」运行本脚本（未收到参数文件）。")
+        return
+
     try:
-        if param_path:                        # 盒子传入 JSON 参数 → 批处理
-            paths = Cli.get_path(param_path)
-            if not paths:
-                print("未获取到有效的文件路径")
-                time.sleep(2)
-            else:
-                Cli().run(paths)
-        else:                                 # 无参 → 打开配置窗口
-            Cli._banner(Cli._title())
-            config = Gui().ask()
-            if config is not None:
-                Gui.save_config(config)
-            print(("  ✅ 配置已保存" if config else "  未保存配置") + "\n")
-            time.sleep(2)
-    except FileNotFoundError as e:            # 缺二进制/webview → 中文报错，停留 3 秒
-        print(f"❌ {e}")
-        time.sleep(3)
+        with open(sys.argv[1], "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"❌ 无法读取参数文件：{e}")
+        return
+
+    env = payload.get("environment") or {}
+    data = payload.get("data") or {}
+    params = payload.get("params") or {}
+
+    # 汇总并过滤视频文件
+    videos = [p for p in _collect_inputs(data) if Path(p).suffix.lower() in VIDEO_EXTS]
+    if not videos:
+        _fail(env, "未找到可转换的视频文件")
+        return
+
+    config = _config_from_params(params)
+    try:
+        converter = VideoConverter(videos, config)
+    except (FileNotFoundError, ValueError) as e:
+        _fail(env, str(e))
+        return
+
+    total = len(videos)
+    counter = [0]
+
+    def on_start(path):
+        counter[0] += 1
+        print(f"▶ ({counter[0]}/{total}) 正在转换: {Path(path).name}")
+
+    def on_progress(pct, time_str):
+        if pct is not None:
+            print(f"\r  进度: {pct:5.1f}%  已编码 {time_str}", end="", flush=True)
+        else:
+            print(f"\r  进度: ...  已编码 {time_str}", end="", flush=True)
+
+    def on_done(path, status, info):
+        print("\r" + " " * 60, end="\r")
+        name = Path(path).name
+        if status == "success":
+            print(f"✅ {name} → {Path(info).name}（{VideoConverter.get_file_size(info)}）")
+        elif status == "skipped":
+            print(f"⏭️ {name}  {info}")
+        else:
+            print(f"❌ {name}  {(info or '未知错误').strip().splitlines()[0]}")
+
+    result = converter.convert(on_start=on_start, on_progress=on_progress, on_done=on_done)
+
+    output_paths = [info for _, info in result["success"]]
+    skipped_paths = [path for path, _ in result["skipped"]]
+    failed_paths = [path for path, _ in result["failed"]]
+
+    parts = [f"成功 {len(result['success'])} 个"]
+    if skipped_paths:
+        parts.append(f"跳过 {len(skipped_paths)} 个")
+    if failed_paths:
+        parts.append(f"失败 {len(failed_paths)} 个")
+    summary = "转换完成：" + "，".join(parts)
+
+    envelope = {
+        "code": 0,
+        "msg": "ok",
+        "summary": summary,
+        "output_paths": output_paths,
+        "skipped_paths": skipped_paths,
+        "failed_paths": failed_paths,
+    }
+    print(summary)
+    _finish(env, envelope, "success" if result["success"] else "error")
 
 
 if __name__ == "__main__":
